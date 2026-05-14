@@ -47,22 +47,35 @@ SERVO_RIGHT_US = 1100
 SERVO_MIN_US = 1000
 SERVO_MAX_US = 2000
 
-# K_LAT                 # how hard it centers between lanes
-# K_HDG                 # how hard it follows turn direction
-# MAX_STEER_DELTA_US    # steering authority limit
-# ALPHA_CENTER          # smoothing of lateral error
-# ALPHA_HEADING         # smoothing of heading error
-
-K_LAT = 7.0
-K_HDG = 10.0
-
 MAX_STEER_DELTA_US = 800
 SEARCH_BIAS_PX = 10
 
-MOTOR_DUTY_PERCENT = 14
+# PID steering uses the fitted lane-center line from the first three ROIs.
+# KP is roughly equivalent to the old proportional steering gain.
+STEER_PID_KP = 10.0
+STEER_PID_KI = 0.0
+STEER_PID_KD = 0
+STEER_PID_INTEGRAL_LIMIT_PX_S = 120.0
+STEER_PID_DERIVATIVE_ALPHA = 0.35
+STEERING_CONTROL_Y = 119
+
+MOTOR_DUTY_PERCENT = 25
 MOTOR_SEARCH_DUTY_PERCENT = 9
 MOTOR_START_BOOST_PERCENT = 24
 MOTOR_START_BOOST_MS = 250
+
+PREEMPTIVE_BRAKE_ENABLE = True
+LOOKAHEAD_BRAKE_START_DEG = 8.0
+LOOKAHEAD_BRAKE_FULL_DEG = 24.0
+LOOKAHEAD_MIN_DUTY_PERCENT = 7
+
+# Far-vs-near lookahead response.
+# Difference is measured in pixels:
+#   far lane center - near fitted-line prediction at the far-field y.
+LOOKAHEAD_STEER_DIFF_SENSITIVITY = 0.4  # 0.05   # demand per px of far/near difference
+LOOKAHEAD_STEER_MAX_US = 90  # 180              # max steering added from far-field change
+LOOKAHEAD_SPEED_DIFF_SENSITIVITY = 0.2  # 0.04   # demand per px of far/near difference
+LOOKAHEAD_SPEED_MAX_DUTY_DROP = 2         # max duty removed from far-field change
 
 MID_HEADING_FALLBACK_ENABLE = True
 MID_HEADING_FALLBACK_MIN_DEG = 3.0
@@ -72,7 +85,6 @@ MID_HEADING_FALLBACK_SCALE = .9  # more = more turning
 TURN_COMMIT_MID_IDXS = (1, 2)      # near-mid and mid slices dominate during commit
 TURN_COMMIT_MID_GAIN = 2.4
 TURN_COMMIT_NEAR_GAIN = 0.60
-TURN_COMMIT_FAR_GAIN = 0.10
 
 TURN_COMMIT_SEARCH_BIAS_PX = 26
 TURN_COMMIT_MIN_STEER_US = 220
@@ -108,7 +120,7 @@ EDGE_SCORE_GAIN = 0.3  # 1.1
 SINGLE_LINE_SCORE_PENALTY = 26
 MIN_ACCEPT_QUALITY = 0.00  # .12
 
-FAR_SLICE_START_IDX = 3
+FAR_SLICE_START_IDX = 4
 FAR_MIN_PAIR_QUALITY = 0.45
 
 MIN_VALID_CENTER_POINTS = 2
@@ -116,12 +128,11 @@ MAX_MISSING_FRAMES = 8
 
 # STEERING CONTROL
 # --------- in basic tuning
-# K_LAT                 # how hard it centers between lanes
-# K_HDG                 # how hard it follows turn direction
+# STEER_PID_KP/KI/KD    # PID steering gains for fitted lane-center line
 # MAX_STEER_DELTA_US    # steering authority limit
 # --------- in vision tuning
-# ALPHA_CENTER          # smoothing of lateral error
-# ALPHA_HEADING         # smoothing of heading error
+# ALPHA_CENTER          # smoothing of fitted-line lateral error
+# ALPHA_HEADING         # smoothing of heading debug / recovery estimate
 
 ALPHA_CENTER = 0.5
 ALPHA_HEADING = 0.85
@@ -213,6 +224,132 @@ def predict_x(points, current_y, fallback_x):
         return clamp(points[-1][0], 0, IMG_W - 1)
 
     return clamp(fallback_x, 0, IMG_W - 1)
+
+
+def fit_center_line_x(points, target_y, fallback_x):
+    n = len(points)
+
+    if n <= 0:
+        return fallback_x
+
+    if n == 1:
+        return points[0][0]
+
+    sum_w = 0.0
+    sum_y = 0.0
+    sum_x = 0.0
+    for p in points:
+        x = p[0]
+        y = p[1]
+        w = p[2] if len(p) >= 3 else 1.0
+        sum_w += w
+        sum_y += y * w
+        sum_x += x * w
+
+    if sum_w <= 0.0:
+        return fallback_x
+
+    mean_y = sum_y / sum_w
+    mean_x = sum_x / sum_w
+
+    var_y = 0.0
+    cov_xy = 0.0
+    for p in points:
+        x = p[0]
+        y = p[1]
+        w = p[2] if len(p) >= 3 else 1.0
+        dy = y - mean_y
+        var_y += w * dy * dy
+        cov_xy += w * dy * (x - mean_x)
+
+    if var_y <= 0.0001:
+        return mean_x
+
+    slope = cov_xy / var_y
+    line_x = mean_x + slope * (target_y - mean_y)
+    return clamp(line_x, 0, IMG_W - 1)
+
+
+def line_heading_deg(points):
+    if len(points) < 2:
+        return 0.0
+
+    lower_point = max(points, key=lambda p: p[1])
+    upper_point = min(points, key=lambda p: p[1])
+
+    dx = upper_point[0] - lower_point[0]
+    dy = lower_point[1] - upper_point[1]
+
+    if dy != 0:
+        return math.degrees(math.atan(dx / dy))
+
+    return 0.0
+
+
+def weighted_center_and_y(points, fallback_x, fallback_y):
+    sum_w = 0.0
+    sum_x = 0.0
+    sum_y = 0.0
+
+    for p in points:
+        x = p[0]
+        y = p[1]
+        w = p[2] if len(p) >= 3 else 1.0
+        sum_w += w
+        sum_x += x * w
+        sum_y += y * w
+
+    if sum_w <= 0.0:
+        return fallback_x, fallback_y
+
+    return sum_x / sum_w, sum_y / sum_w
+
+
+def update_steering_pid(error_px, now_ms):
+    global steer_pid_integral, steer_pid_prev_error, steer_pid_prev_ms
+    global steer_pid_filtered_derivative
+
+    if steer_pid_prev_ms is None:
+        steer_pid_prev_ms = now_ms
+        steer_pid_prev_error = error_px
+        steer_pid_filtered_derivative = 0.0
+
+    dt_ms = time.ticks_diff(now_ms, steer_pid_prev_ms)
+    if dt_ms <= 0:
+        dt = 0.001
+    else:
+        dt = dt_ms / 1000.0
+
+    steer_pid_integral += error_px * dt
+    steer_pid_integral = clamp(
+        steer_pid_integral,
+        -STEER_PID_INTEGRAL_LIMIT_PX_S,
+        STEER_PID_INTEGRAL_LIMIT_PX_S
+    )
+
+    derivative = (error_px - steer_pid_prev_error) / dt
+    steer_pid_filtered_derivative = lowpass(
+        steer_pid_filtered_derivative,
+        derivative,
+        STEER_PID_DERIVATIVE_ALPHA
+    )
+
+    steer_pid_prev_error = error_px
+    steer_pid_prev_ms = now_ms
+
+    return (STEER_PID_KP * error_px) + \
+           (STEER_PID_KI * steer_pid_integral) + \
+           (STEER_PID_KD * steer_pid_filtered_derivative)
+
+
+def reset_steering_pid():
+    global steer_pid_integral, steer_pid_prev_error, steer_pid_prev_ms
+    global steer_pid_filtered_derivative
+
+    steer_pid_integral = 0.0
+    steer_pid_prev_error = 0.0
+    steer_pid_prev_ms = None
+    steer_pid_filtered_derivative = 0.0
 
 
 # -------------------------- LEDS --------------------------
@@ -390,12 +527,9 @@ def choose_lane_candidate(blobs, pred_center, expected_width, pred_left, pred_ri
     # --------------------------------------------------
     # 2. Single-line fallback
     # --------------------------------------------------
-    # Old behavior:
-    #   estimate lane center using expected_width / 2
-    #
-    # New behavior:
-    #   follow the visible line directly.
-    #   Do NOT pretend this is the lane center.
+    # Estimate the lane center from one visible marking.
+    # This keeps the tracker centered between lanes instead of steering
+    # directly onto a single stripe.
     # --------------------------------------------------
     if not allow_one_line:
         return None
@@ -410,8 +544,7 @@ def choose_lane_candidate(blobs, pred_center, expected_width, pred_left, pred_ri
         # relative to the predicted lane center.
         if bx < pred_center:
             # Visible line is probably the left lane marking.
-            # Follow this line directly and mark right side as missing.
-            center_x = bx
+            center_x = bx + (expected_width * 0.5)
             left_seen = True
             right_seen = False
             missing_side = 1      # +1 means search right later if desired
@@ -422,8 +555,7 @@ def choose_lane_candidate(blobs, pred_center, expected_width, pred_left, pred_ri
 
         else:
             # Visible line is probably the right lane marking.
-            # Follow this line directly and mark left side as missing.
-            center_x = bx
+            center_x = bx - (expected_width * 0.5)
             left_seen = False
             right_seen = True
             missing_side = -1     # -1 means search left later if desired
@@ -432,11 +564,11 @@ def choose_lane_candidate(blobs, pred_center, expected_width, pred_left, pred_ri
 
             edge_err = abs(bx - pred_right) if pred_right is not None else 0.0
 
+        center_x = clamp(center_x, 0, IMG_W - 1)
         center_err = abs(center_x - pred_center)
 
-        # Lower penalty than before because this is now an intentional
-        # single-line-following mode, not a fake lane-center estimate.
-        score = (CENTER_SCORE_GAIN * center_err) + \
+        score = SINGLE_LINE_SCORE_PENALTY + \
+                (CENTER_SCORE_GAIN * center_err) + \
                 (EDGE_SCORE_GAIN * edge_err)
 
         if score < best_single_score:
@@ -467,6 +599,11 @@ last_valid_lateral = 0.0
 last_valid_heading = 0.0
 last_valid_lane_width = EXPECTED_LANE_WIDTH
 
+steer_pid_integral = 0.0
+steer_pid_prev_error = 0.0
+steer_pid_prev_ms = None
+steer_pid_filtered_derivative = 0.0
+
 last_left_x = IMG_CENTER_X - (EXPECTED_LANE_WIDTH * 0.5)
 last_right_x = IMG_CENTER_X + (EXPECTED_LANE_WIDTH * 0.5)
 last_center = IMG_CENTER_X
@@ -485,9 +622,12 @@ leds()
 while True:
     clock.tick()
     frame_counter += 1
+    now_ms = time.ticks_ms()
     img = sensor.snapshot()
 
     center_points = []
+    steering_center_points = []
+    far_center_points = []
     center_history = []
     left_history = []
     right_history = []
@@ -511,6 +651,11 @@ while True:
 
     far_pair_streak = 0
     best_far_pair_streak = 0
+    lookahead_heading_deg = 0.0
+    lookahead_brake_demand = 0.0
+    lookahead_diff_px = 0.0
+    lookahead_steer_us = 0.0
+    lookahead_speed_demand = 0.0
 
     expected_width = last_valid_lane_width if last_valid_lane_width > 0 else EXPECTED_LANE_WIDTH
 
@@ -558,6 +703,10 @@ while True:
 
         cx = cand["center_x"]
         center_points.append((cx, y_mid, eff_weight))
+        if idx < FAR_SLICE_START_IDX:
+            steering_center_points.append((cx, y_mid, eff_weight))
+        else:
+            far_center_points.append((cx, y_mid, eff_weight))
         center_history.append((cx, y_mid))
 
         accepted.append({
@@ -593,7 +742,7 @@ while True:
             if cand["right_seen"]:
                 far_right_seen += 1
 
-        if cand["pair"]:
+        if cand["pair"] and idx < FAR_SLICE_START_IDX:
             lane_widths.append(cand["lane_width"])
 
         if cand["left_seen"] and cand["left_blob"] is not None:
@@ -679,7 +828,7 @@ while True:
         commit_direction = 0
 
     # ---------------- Lane estimate ----------------
-    lane_detected = (len(center_points) >= MIN_VALID_CENTER_POINTS)
+    lane_detected = (len(steering_center_points) >= MIN_VALID_CENTER_POINTS)
 
     if lane_detected:
         missing_frames = 0
@@ -689,21 +838,22 @@ while True:
             weight_sum = 0.0
 
             for a in accepted:
+                if a["idx"] >= FAR_SLICE_START_IDX:
+                    continue
+
                 w = a["eff_weight"]
 
                 if a["idx"] in TURN_COMMIT_MID_IDXS:
                     w *= TURN_COMMIT_MID_GAIN
                 elif a["idx"] == 0:
                     w *= TURN_COMMIT_NEAR_GAIN
-                elif a["idx"] >= FAR_SLICE_START_IDX:
-                    w *= TURN_COMMIT_FAR_GAIN
 
                 weighted_center_sum += a["center_x"] * w
                 weight_sum += w
         else:
             weighted_center_sum = 0.0
             weight_sum = 0.0
-            for cx, cy, w_eff in center_points:
+            for cx, cy, w_eff in steering_center_points:
                 weighted_center_sum += cx * w_eff
                 weight_sum += w_eff
 
@@ -732,19 +882,8 @@ while True:
 
         img.draw_line(IMG_CENTER_X, 0, IMG_CENTER_X, IMG_H, color=BLACK)
 
-        if len(center_points) >= 2:
-            lower_point = max(center_points, key=lambda p: p[1])
-            upper_point = min(center_points, key=lambda p: p[1])
-
-            dx = upper_point[0] - lower_point[0]
-            dy = lower_point[1] - upper_point[1]
-
-            if dy != 0:
-                raw_heading_deg = math.degrees(math.atan(dx / dy))
-            else:
-                raw_heading_deg = 0.0
-        else:
-            raw_heading_deg = 0.0
+        raw_heading_deg = line_heading_deg(steering_center_points)
+        lookahead_heading_deg = line_heading_deg(far_center_points)
 
         if near_pair_seen and abs(mid_heading_deg) >= TURN_COMMIT_MIN_HEADING_DEG:
             heading_error_deg = mid_heading_deg
@@ -756,22 +895,54 @@ while True:
             heading_error_deg = mid_heading_deg * MID_HEADING_FALLBACK_SCALE
 
         else:
-            if best_far_pair_streak >= 3:
-                heading_scale = 1.0
-            elif best_far_pair_streak == 2:
-                heading_scale = 0.65
-            elif best_far_pair_streak == 1:
-                heading_scale = 0.30
+            heading_error_deg = raw_heading_deg
+
+        lane_line_x = fit_center_line_x(
+            steering_center_points,
+            STEERING_CONTROL_Y,
+            lane_center_x
+        )
+        lane_line_error_px = lane_line_x - IMG_CENTER_X
+
+        if len(far_center_points) > 0:
+            far_center_x, far_center_y = weighted_center_and_y(
+                far_center_points,
+                lane_center_x,
+                STEERING_CONTROL_Y
+            )
+            near_at_far_x = fit_center_line_x(
+                steering_center_points,
+                far_center_y,
+                lane_center_x
+            )
+            lookahead_diff_px = far_center_x - near_at_far_x
+            lookahead_steer_demand = clamp(
+                abs(lookahead_diff_px) * LOOKAHEAD_STEER_DIFF_SENSITIVITY,
+                0.0,
+                1.0
+            )
+            if lookahead_diff_px < 0:
+                lookahead_steer_us = -LOOKAHEAD_STEER_MAX_US * lookahead_steer_demand
             else:
-                heading_scale = 0.0
+                lookahead_steer_us = LOOKAHEAD_STEER_MAX_US * lookahead_steer_demand
 
-            heading_error_deg = raw_heading_deg * heading_scale
+            lookahead_speed_demand = clamp(
+                abs(lookahead_diff_px) * LOOKAHEAD_SPEED_DIFF_SENSITIVITY,
+                0.0,
+                1.0
+            )
 
-        filtered_lateral_error = lowpass(filtered_lateral_error, lateral_error_px, ALPHA_CENTER)
+        filtered_lateral_error = lowpass(filtered_lateral_error, lane_line_error_px, ALPHA_CENTER)
         filtered_heading_error = lowpass(filtered_heading_error, heading_error_deg, ALPHA_HEADING)
 
         last_valid_lateral = filtered_lateral_error
         last_valid_heading = filtered_heading_error
+
+        if PREEMPTIVE_BRAKE_ENABLE and len(far_center_points) >= 2:
+            lookahead_abs = abs(lookahead_heading_deg)
+            lookahead_brake_demand = (lookahead_abs - LOOKAHEAD_BRAKE_START_DEG) / \
+                                     (LOOKAHEAD_BRAKE_FULL_DEG - LOOKAHEAD_BRAKE_START_DEG)
+            lookahead_brake_demand = clamp(lookahead_brake_demand, 0.0, 1.0)
 
         if base_weight_sum > 0:
             confidence = effective_weight_sum / base_weight_sum
@@ -783,6 +954,11 @@ while True:
     else:
         missing_frames += 1
         confidence = 0.0
+        lookahead_heading_deg = 0.0
+        lookahead_brake_demand = 0.0
+        lookahead_diff_px = 0.0
+        lookahead_steer_us = 0.0
+        lookahead_speed_demand = 0.0
 
         if missing_frames <= MAX_MISSING_FRAMES:
             filtered_lateral_error = last_valid_lateral
@@ -790,6 +966,7 @@ while True:
         else:
             filtered_lateral_error *= 0.8
             filtered_heading_error *= 0.8
+            reset_steering_pid()
 
     # ---------------- Search bias ----------------
     if ENABLE_RECOVERY_LOGIC:
@@ -819,7 +996,12 @@ while True:
             mode = "LOST"
 
     # ---------------- Steering output ----------------
-    steer_term = (K_LAT * commanded_lateral_error) + (K_HDG * filtered_heading_error)
+    if mode == "LOST":
+        reset_steering_pid()
+        steer_term = 0.0
+    else:
+        steer_term = update_steering_pid(commanded_lateral_error, now_ms)
+        steer_term += lookahead_steer_us
 
     if ENABLE_RECOVERY_LOGIC:
         if turn_commit and commit_direction != 0:
@@ -847,6 +1029,11 @@ while True:
         steering_demand = abs(steer_term) / float(MAX_STEER_DELTA_US)
         steering_demand = clamp(steering_demand, 0.0, 1.0)
         duty = MOTOR_DUTY_PERCENT - int((MOTOR_DUTY_PERCENT - MOTOR_SEARCH_DUTY_PERCENT) * steering_demand)
+        if PREEMPTIVE_BRAKE_ENABLE:
+            duty -= int((duty - LOOKAHEAD_MIN_DUTY_PERCENT) * lookahead_brake_demand)
+            duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
+        duty -= int(LOOKAHEAD_SPEED_MAX_DUTY_DROP * lookahead_speed_demand)
+        duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
         leds(green=True)
         motor_forward(duty)
     else:
@@ -860,13 +1047,18 @@ while True:
             steering_demand = abs(steer_term) / float(MAX_STEER_DELTA_US)
             steering_demand = clamp(steering_demand, 0.0, 1.0)
             duty = MOTOR_DUTY_PERCENT - int((MOTOR_DUTY_PERCENT - MOTOR_SEARCH_DUTY_PERCENT) * steering_demand)
+            if PREEMPTIVE_BRAKE_ENABLE:
+                duty -= int((duty - LOOKAHEAD_MIN_DUTY_PERCENT) * lookahead_brake_demand)
+                duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
+            duty -= int(LOOKAHEAD_SPEED_MAX_DUTY_DROP * lookahead_speed_demand)
+            duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
             leds(green=True)
 
         motor_forward(duty)
 
     # ---------------- Debug ----------------
     if frame_counter % PRINT_EVERY == 0:
-        print("fps:%.1f mode:%s conf:%.2f lat:%.2f cmd_lat:%.2f hdg:%.2f mid_hdg:%.2f nearPair:%d nearQ:%.2f width:%.2f servo:%d motor:%d far_streak:%d farMissL:%d farMissR:%d" %
+        print("fps:%.1f mode:%s conf:%.2f pid_err:%.2f cmd_err:%.2f hdg:%.2f mid_hdg:%.2f look_hdg:%.2f look_diff:%.2f look_steer:%.1f brake:%.2f look_spd:%.2f nearPair:%d nearQ:%.2f width:%.2f servo:%d motor:%d far_streak:%d farMissL:%d farMissR:%d" %
               (clock.fps(),
                mode,
                confidence,
@@ -874,6 +1066,11 @@ while True:
                commanded_lateral_error,
                filtered_heading_error,
                mid_heading_deg,
+               lookahead_heading_deg,
+               lookahead_diff_px,
+               lookahead_steer_us,
+               lookahead_brake_demand,
+               lookahead_speed_demand,
                1 if near_pair_seen else 0,
                near_pair_quality,
                last_valid_lane_width,
