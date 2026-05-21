@@ -35,6 +35,8 @@ MOTOR_FREQ_HZ = 1500
 INA_PIN = "P4"
 INB_PIN = "P5"
 
+SPEED_SENSOR_PIN = "P2"
+
 # -------------------------- BASIC TUNING --------------------------
 STEERING_REVERSE = False
 MOTOR_REVERSE = False
@@ -52,17 +54,55 @@ SEARCH_BIAS_PX = 10
 
 # PID steering uses the fitted lane-center line from the first three ROIs.
 # KP is roughly equivalent to the old proportional steering gain.
-STEER_PID_KP = 10.0
+STEER_PID_KP = 7.0
 STEER_PID_KI = 0.0
-STEER_PID_KD = 0
+STEER_PID_KD = 0.3
 STEER_PID_INTEGRAL_LIMIT_PX_S = 120.0
 STEER_PID_DERIVATIVE_ALPHA = 0.35
 STEERING_CONTROL_Y = 119
 
+STEER_SPEED_ADAPT_ENABLE = True
+STEER_SPEED_HIGH_RPM = 900.0
+STEER_KP_HIGH_SPEED_SCALE = 0.75
+STEER_KD_HIGH_SPEED_SCALE = 1.10
+LOOKAHEAD_STEER_HIGH_SPEED_SCALE = 1.35
+
 MOTOR_DUTY_PERCENT = 25
+MOTOR_MAX_DUTY_PERCENT = 35
 MOTOR_SEARCH_DUTY_PERCENT = 9
 MOTOR_START_BOOST_PERCENT = 24
 MOTOR_START_BOOST_MS = 250
+
+SPEED_CONTROL_ENABLE = True
+SPEED_SENSOR_PULSES_PER_REV = 3
+SPEED_SENSOR_SAMPLE_MS = 100
+SPEED_SENSOR_STALE_MS = 500
+SPEED_SENSOR_MIN_PULSE_US = 1000
+SPEED_SENSOR_ALPHA = 0.45
+SPEED_SENSOR_PULL = Pin.PULL_UP
+SPEED_SENSOR_EDGE = pyb.ExtInt.IRQ_RISING
+
+TARGET_STRAIGHT_RPM = 900.0
+TARGET_MIN_TURN_RPM = 350.0
+TARGET_SEARCH_RPM = 300.0
+TARGET_TURN_COMMIT_RPM = 300.0
+TARGET_CONFIDENCE_SLOWDOWN_BELOW = 0.35
+TARGET_CONFIDENCE_SLOWDOWN_AMOUNT = 0.45
+
+SPEED_PID_KP = 0.020
+SPEED_PID_KI = 0.006
+SPEED_PID_KD = 0.0
+SPEED_PID_INTEGRAL_LIMIT_RPM_S = 1500.0
+SPEED_PID_DERIVATIVE_ALPHA = 0.35
+SPEED_PID_MAX_DUTY_TRIM = 12
+
+SPEED_STALL_DETECT_ENABLE = True
+SPEED_STALL_DUTY_THRESHOLD = 22
+SPEED_STALL_RPM_THRESHOLD = 60.0
+SPEED_STALL_TARGET_RPM_THRESHOLD = 250.0
+SPEED_STALL_TIMEOUT_MS = 1000
+SPEED_OVERSPEED_RPM_MARGIN = 180.0
+SPEED_OVERSPEED_DUTY_DROP = 3
 
 PREEMPTIVE_BRAKE_ENABLE = True
 LOOKAHEAD_BRAKE_START_DEG = 8.0
@@ -72,10 +112,10 @@ LOOKAHEAD_MIN_DUTY_PERCENT = 7
 # Far-vs-near lookahead response.
 # Difference is measured in pixels:
 #   far lane center - near fitted-line prediction at the far-field y.
-LOOKAHEAD_STEER_DIFF_SENSITIVITY = 0.4  # 0.05   # demand per px of far/near difference
-LOOKAHEAD_STEER_MAX_US = 90  # 180              # max steering added from far-field change
+LOOKAHEAD_STEER_DIFF_SENSITIVITY = 0.09  # 0.05   # demand per px of far/near difference
+LOOKAHEAD_STEER_MAX_US = 120  # 180              # max steering added from far-field change
 LOOKAHEAD_SPEED_DIFF_SENSITIVITY = 0.2  # 0.04   # demand per px of far/near difference
-LOOKAHEAD_SPEED_MAX_DUTY_DROP = 2         # max duty removed from far-field change
+LOOKAHEAD_SPEED_MAX_DUTY_DROP = 4         # max duty removed from far-field change
 
 MID_HEADING_FALLBACK_ENABLE = True
 MID_HEADING_FALLBACK_MIN_DEG = 3.0
@@ -305,7 +345,7 @@ def weighted_center_and_y(points, fallback_x, fallback_y):
     return sum_x / sum_w, sum_y / sum_w
 
 
-def update_steering_pid(error_px, now_ms):
+def update_steering_pid(error_px, now_ms, kp_scale=1.0, kd_scale=1.0):
     global steer_pid_integral, steer_pid_prev_error, steer_pid_prev_ms
     global steer_pid_filtered_derivative
 
@@ -337,9 +377,9 @@ def update_steering_pid(error_px, now_ms):
     steer_pid_prev_error = error_px
     steer_pid_prev_ms = now_ms
 
-    return (STEER_PID_KP * error_px) + \
+    return (STEER_PID_KP * kp_scale * error_px) + \
            (STEER_PID_KI * steer_pid_integral) + \
-           (STEER_PID_KD * steer_pid_filtered_derivative)
+           (STEER_PID_KD * kd_scale * steer_pid_filtered_derivative)
 
 
 def reset_steering_pid():
@@ -350,6 +390,147 @@ def reset_steering_pid():
     steer_pid_prev_error = 0.0
     steer_pid_prev_ms = None
     steer_pid_filtered_derivative = 0.0
+
+
+def speed_sensor_cb(line):
+    global speed_pulse_count, speed_last_pulse_us, speed_last_pulse_ms
+
+    now_us = time.ticks_us()
+    if speed_last_pulse_us is None or \
+            time.ticks_diff(now_us, speed_last_pulse_us) >= SPEED_SENSOR_MIN_PULSE_US:
+        speed_pulse_count += 1
+        speed_last_pulse_us = now_us
+        speed_last_pulse_ms = time.ticks_ms()
+
+
+def update_speed_sensor(now_ms):
+    global speed_pulse_count, speed_last_sample_ms, measured_speed_rpm
+    global filtered_speed_rpm
+
+    dt_ms = time.ticks_diff(now_ms, speed_last_sample_ms)
+    if dt_ms < SPEED_SENSOR_SAMPLE_MS:
+        return measured_speed_rpm
+
+    irq_state = pyb.disable_irq()
+    pulses = speed_pulse_count
+    speed_pulse_count = 0
+    pyb.enable_irq(irq_state)
+
+    speed_last_sample_ms = now_ms
+
+    if pulses > 0:
+        rpm = (pulses * 60000.0) / (SPEED_SENSOR_PULSES_PER_REV * dt_ms)
+        filtered_speed_rpm = lowpass(filtered_speed_rpm, rpm, SPEED_SENSOR_ALPHA)
+    elif not speed_sensor_active(now_ms):
+        filtered_speed_rpm = lowpass(filtered_speed_rpm, 0.0, SPEED_SENSOR_ALPHA)
+
+    measured_speed_rpm = filtered_speed_rpm
+    return measured_speed_rpm
+
+
+def speed_sensor_active(now_ms):
+    if speed_last_pulse_ms is None:
+        return False
+    return time.ticks_diff(now_ms, speed_last_pulse_ms) <= SPEED_SENSOR_STALE_MS
+
+
+def speed_sensor_has_seen_pulse():
+    return speed_last_pulse_ms is not None
+
+
+def reset_speed_pid():
+    global speed_pid_integral, speed_pid_prev_error, speed_pid_prev_ms
+    global speed_pid_filtered_derivative
+
+    speed_pid_integral = 0.0
+    speed_pid_prev_error = 0.0
+    speed_pid_prev_ms = None
+    speed_pid_filtered_derivative = 0.0
+
+
+def update_speed_pid(target_rpm, measured_rpm, base_duty, now_ms, sensor_ok):
+    global speed_pid_integral, speed_pid_prev_error, speed_pid_prev_ms
+    global speed_pid_filtered_derivative
+
+    if not SPEED_CONTROL_ENABLE or not sensor_ok or target_rpm <= 0.0:
+        reset_speed_pid()
+        return int(clamp(base_duty, 0, MOTOR_MAX_DUTY_PERCENT))
+
+    if speed_pid_prev_ms is None:
+        speed_pid_prev_ms = now_ms
+        speed_pid_prev_error = target_rpm - measured_rpm
+        speed_pid_filtered_derivative = 0.0
+
+    dt_ms = time.ticks_diff(now_ms, speed_pid_prev_ms)
+    if dt_ms <= 0:
+        dt = 0.001
+    else:
+        dt = dt_ms / 1000.0
+
+    error = target_rpm - measured_rpm
+    speed_pid_integral += error * dt
+    speed_pid_integral = clamp(
+        speed_pid_integral,
+        -SPEED_PID_INTEGRAL_LIMIT_RPM_S,
+        SPEED_PID_INTEGRAL_LIMIT_RPM_S
+    )
+
+    derivative = (error - speed_pid_prev_error) / dt
+    speed_pid_filtered_derivative = lowpass(
+        speed_pid_filtered_derivative,
+        derivative,
+        SPEED_PID_DERIVATIVE_ALPHA
+    )
+
+    speed_pid_prev_error = error
+    speed_pid_prev_ms = now_ms
+
+    trim = (SPEED_PID_KP * error) + \
+           (SPEED_PID_KI * speed_pid_integral) + \
+           (SPEED_PID_KD * speed_pid_filtered_derivative)
+    trim = clamp(trim, -SPEED_PID_MAX_DUTY_TRIM, SPEED_PID_MAX_DUTY_TRIM)
+
+    return int(clamp(base_duty + trim, 0, MOTOR_MAX_DUTY_PERCENT))
+
+
+def compute_target_speed_rpm(mode, path_risk, confidence):
+    if mode == "LOST":
+        return 0.0
+    if mode == "SEARCH":
+        return TARGET_SEARCH_RPM
+    if mode == "TURN_COMMIT":
+        return TARGET_TURN_COMMIT_RPM
+
+    if confidence < TARGET_CONFIDENCE_SLOWDOWN_BELOW:
+        path_risk = max(path_risk, TARGET_CONFIDENCE_SLOWDOWN_AMOUNT)
+
+    path_risk = clamp(path_risk, 0.0, 1.0)
+    return TARGET_STRAIGHT_RPM - \
+           ((TARGET_STRAIGHT_RPM - TARGET_MIN_TURN_RPM) * path_risk)
+
+
+def update_speed_fault(duty, target_rpm, measured_rpm, now_ms):
+    global speed_fault_start_ms, speed_fault_active
+
+    if not SPEED_STALL_DETECT_ENABLE or not speed_sensor_has_seen_pulse():
+        speed_fault_start_ms = None
+        speed_fault_active = False
+        return False
+
+    fault_candidate = duty >= SPEED_STALL_DUTY_THRESHOLD and \
+                      target_rpm >= SPEED_STALL_TARGET_RPM_THRESHOLD and \
+                      measured_rpm <= SPEED_STALL_RPM_THRESHOLD
+
+    if fault_candidate:
+        if speed_fault_start_ms is None:
+            speed_fault_start_ms = now_ms
+        elif time.ticks_diff(now_ms, speed_fault_start_ms) >= SPEED_STALL_TIMEOUT_MS:
+            speed_fault_active = True
+    else:
+        speed_fault_start_ms = None
+        speed_fault_active = False
+
+    return speed_fault_active
 
 
 # -------------------------- LEDS --------------------------
@@ -374,6 +555,16 @@ servo_pulse_us = SERVO_CENTER_US
 
 motor_timer = Timer(MOTOR_TIMER_ID, freq=MOTOR_FREQ_HZ)
 motor_ch = motor_timer.channel(MOTOR_TIMER_CH, Timer.PWM, pin=Pin(MOTOR_PIN))
+
+speed_pulse_count = 0
+speed_last_pulse_us = None
+speed_last_pulse_ms = None
+speed_last_sample_ms = time.ticks_ms()
+measured_speed_rpm = 0.0
+filtered_speed_rpm = 0.0
+
+speed_pin = Pin(SPEED_SENSOR_PIN, Pin.IN, SPEED_SENSOR_PULL)
+speed_extint = pyb.ExtInt(speed_pin, SPEED_SENSOR_EDGE, SPEED_SENSOR_PULL, speed_sensor_cb)
 
 
 def set_servo_us(us):
@@ -604,6 +795,13 @@ steer_pid_prev_error = 0.0
 steer_pid_prev_ms = None
 steer_pid_filtered_derivative = 0.0
 
+speed_pid_integral = 0.0
+speed_pid_prev_error = 0.0
+speed_pid_prev_ms = None
+speed_pid_filtered_derivative = 0.0
+speed_fault_start_ms = None
+speed_fault_active = False
+
 last_left_x = IMG_CENTER_X - (EXPECTED_LANE_WIDTH * 0.5)
 last_right_x = IMG_CENTER_X + (EXPECTED_LANE_WIDTH * 0.5)
 last_center = IMG_CENTER_X
@@ -623,6 +821,8 @@ while True:
     clock.tick()
     frame_counter += 1
     now_ms = time.ticks_ms()
+    measured_speed_rpm = update_speed_sensor(now_ms)
+    speed_sensor_ok = speed_sensor_active(now_ms)
     img = sensor.snapshot()
 
     center_points = []
@@ -656,6 +856,11 @@ while True:
     lookahead_diff_px = 0.0
     lookahead_steer_us = 0.0
     lookahead_speed_demand = 0.0
+    target_speed_rpm = 0.0
+    path_speed_risk = 0.0
+    speed_control_active = False
+    speed_fault = False
+    speed_overspeed = False
 
     expected_width = last_valid_lane_width if last_valid_lane_width > 0 else EXPECTED_LANE_WIDTH
 
@@ -996,12 +1201,27 @@ while True:
             mode = "LOST"
 
     # ---------------- Steering output ----------------
+    if STEER_SPEED_ADAPT_ENABLE and speed_sensor_ok:
+        speed_ratio = clamp(measured_speed_rpm / STEER_SPEED_HIGH_RPM, 0.0, 1.0)
+    else:
+        speed_ratio = 0.0
+
+    steer_kp_scale = 1.0 + ((STEER_KP_HIGH_SPEED_SCALE - 1.0) * speed_ratio)
+    steer_kd_scale = 1.0 + ((STEER_KD_HIGH_SPEED_SCALE - 1.0) * speed_ratio)
+    lookahead_steer_speed_scale = 1.0 + \
+                                   ((LOOKAHEAD_STEER_HIGH_SPEED_SCALE - 1.0) * speed_ratio)
+
     if mode == "LOST":
         reset_steering_pid()
         steer_term = 0.0
     else:
-        steer_term = update_steering_pid(commanded_lateral_error, now_ms)
-        steer_term += lookahead_steer_us
+        steer_term = update_steering_pid(
+            commanded_lateral_error,
+            now_ms,
+            steer_kp_scale,
+            steer_kd_scale
+        )
+        steer_term += lookahead_steer_us * lookahead_steer_speed_scale
 
     if ENABLE_RECOVERY_LOGIC:
         if turn_commit and commit_direction != 0:
@@ -1023,42 +1243,58 @@ while True:
 
     # ---------------- Motor output ----------------
     if mode == "LOST":
+        reset_speed_pid()
+        speed_fault_start_ms = None
+        speed_fault_active = False
         motor_stop()
         leds(red=True)
-    elif ENABLE_RECOVERY_LOGIC:
+    else:
         steering_demand = abs(steer_term) / float(MAX_STEER_DELTA_US)
         steering_demand = clamp(steering_demand, 0.0, 1.0)
-        duty = MOTOR_DUTY_PERCENT - int((MOTOR_DUTY_PERCENT - MOTOR_SEARCH_DUTY_PERCENT) * steering_demand)
+        path_speed_risk = max(steering_demand, lookahead_speed_demand)
         if PREEMPTIVE_BRAKE_ENABLE:
-            duty -= int((duty - LOOKAHEAD_MIN_DUTY_PERCENT) * lookahead_brake_demand)
-            duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
-        duty -= int(LOOKAHEAD_SPEED_MAX_DUTY_DROP * lookahead_speed_demand)
-        duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
-        leds(green=True)
-        motor_forward(duty)
-    else:
+            path_speed_risk = max(path_speed_risk, lookahead_brake_demand)
+        path_speed_risk = clamp(path_speed_risk, 0.0, 1.0)
+
         if mode == "TURN_COMMIT":
-            duty = TURN_COMMIT_DUTY_PERCENT
+            base_duty = TURN_COMMIT_DUTY_PERCENT
             leds(red=True, green=True)
         elif mode == "SEARCH":
-            duty = MOTOR_SEARCH_DUTY_PERCENT
+            base_duty = MOTOR_SEARCH_DUTY_PERCENT
             leds(red=True, blue=True)
         else:
-            steering_demand = abs(steer_term) / float(MAX_STEER_DELTA_US)
-            steering_demand = clamp(steering_demand, 0.0, 1.0)
-            duty = MOTOR_DUTY_PERCENT - int((MOTOR_DUTY_PERCENT - MOTOR_SEARCH_DUTY_PERCENT) * steering_demand)
-            if PREEMPTIVE_BRAKE_ENABLE:
-                duty -= int((duty - LOOKAHEAD_MIN_DUTY_PERCENT) * lookahead_brake_demand)
-                duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
-            duty -= int(LOOKAHEAD_SPEED_MAX_DUTY_DROP * lookahead_speed_demand)
-            duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_DUTY_PERCENT))
+            base_duty = MOTOR_DUTY_PERCENT - \
+                        int((MOTOR_DUTY_PERCENT - MOTOR_SEARCH_DUTY_PERCENT) * path_speed_risk)
             leds(green=True)
 
-        motor_forward(duty)
+        base_duty -= int(LOOKAHEAD_SPEED_MAX_DUTY_DROP * lookahead_speed_demand)
+        base_duty = int(clamp(base_duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_MAX_DUTY_PERCENT))
+
+        target_speed_rpm = compute_target_speed_rpm(mode, path_speed_risk, confidence)
+        duty = update_speed_pid(
+            target_speed_rpm,
+            measured_speed_rpm,
+            base_duty,
+            now_ms,
+            speed_sensor_ok
+        )
+        speed_control_active = SPEED_CONTROL_ENABLE and speed_sensor_ok and target_speed_rpm > 0.0
+        speed_overspeed = speed_sensor_ok and \
+                          measured_speed_rpm > (target_speed_rpm + SPEED_OVERSPEED_RPM_MARGIN)
+        if speed_overspeed:
+            duty -= SPEED_OVERSPEED_DUTY_DROP
+        speed_fault = update_speed_fault(duty, target_speed_rpm, measured_speed_rpm, now_ms)
+        if speed_fault:
+            reset_speed_pid()
+            motor_stop()
+            leds(red=True, blue=True)
+        else:
+            duty = int(clamp(duty, LOOKAHEAD_MIN_DUTY_PERCENT, MOTOR_MAX_DUTY_PERCENT))
+            motor_forward(duty)
 
     # ---------------- Debug ----------------
     if frame_counter % PRINT_EVERY == 0:
-        print("fps:%.1f mode:%s conf:%.2f pid_err:%.2f cmd_err:%.2f hdg:%.2f mid_hdg:%.2f look_hdg:%.2f look_diff:%.2f look_steer:%.1f brake:%.2f look_spd:%.2f nearPair:%d nearQ:%.2f width:%.2f servo:%d motor:%d far_streak:%d farMissL:%d farMissR:%d" %
+        print("fps:%.1f mode:%s conf:%.2f pid_err:%.2f cmd_err:%.2f hdg:%.2f mid_hdg:%.2f look_hdg:%.2f look_diff:%.2f look_steer:%.1f brake:%.2f look_spd:%.2f rpm:%.1f tgt:%.1f spdCtl:%d spdOk:%d over:%d fault:%d risk:%.2f kpS:%.2f kdS:%.2f nearPair:%d nearQ:%.2f width:%.2f servo:%d motor:%d far_streak:%d farMissL:%d farMissR:%d" %
               (clock.fps(),
                mode,
                confidence,
@@ -1071,6 +1307,15 @@ while True:
                lookahead_steer_us,
                lookahead_brake_demand,
                lookahead_speed_demand,
+               measured_speed_rpm,
+               target_speed_rpm,
+               1 if speed_control_active else 0,
+               1 if speed_sensor_ok else 0,
+               1 if speed_overspeed else 0,
+               1 if speed_fault else 0,
+               path_speed_risk,
+               steer_kp_scale,
+               steer_kd_scale,
                1 if near_pair_seen else 0,
                near_pair_quality,
                last_valid_lane_width,
