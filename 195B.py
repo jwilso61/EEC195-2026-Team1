@@ -6,6 +6,8 @@ import pyb
 import micropython
 from pyb import Pin, Timer, LED
 
+# Fin
+
 micropython.alloc_emergency_exception_buf(100)
 
 BLACK = 0
@@ -54,21 +56,21 @@ SEARCH_BIAS_PX = 10
 
 # PID steering uses the fitted lane-center line from the first three ROIs.
 # KP is roughly equivalent to the old proportional steering gain.
-STEER_PID_KP = 7.0
+STEER_PID_KP = 7.0 # 7.0 # 8.0
 STEER_PID_KI = 0.0
-STEER_PID_KD = 0.3
+STEER_PID_KD = 0.65 # 0.6 # 0.5 # 1.5 # 1.2 # 1.0 # 0.9 # 0.5 # 0.3
 STEER_PID_INTEGRAL_LIMIT_PX_S = 120.0
 STEER_PID_DERIVATIVE_ALPHA = 0.35
-STEERING_CONTROL_Y = 119
+STEERING_CONTROL_Y = 60 # 75 # 90 # 119
 
 STEER_SPEED_ADAPT_ENABLE = True
-STEER_SPEED_HIGH_RPM = 900.0
-STEER_KP_HIGH_SPEED_SCALE = 0.75
-STEER_KD_HIGH_SPEED_SCALE = 1.10
+STEER_SPEED_HIGH_RPM = 1000.0
+STEER_KP_HIGH_SPEED_SCALE = 1.0 # 0.90 # 0.75
+STEER_KD_HIGH_SPEED_SCALE = 1.00
 LOOKAHEAD_STEER_HIGH_SPEED_SCALE = 1.35
 
-MOTOR_DUTY_PERCENT = 25
-MOTOR_MAX_DUTY_PERCENT = 35
+MOTOR_DUTY_PERCENT = 80
+MOTOR_MAX_DUTY_PERCENT = 90
 MOTOR_SEARCH_DUTY_PERCENT = 9
 MOTOR_START_BOOST_PERCENT = 24
 MOTOR_START_BOOST_MS = 250
@@ -82,15 +84,15 @@ SPEED_SENSOR_ALPHA = 0.45
 SPEED_SENSOR_PULL = Pin.PULL_UP
 SPEED_SENSOR_EDGE = pyb.ExtInt.IRQ_RISING
 
-TARGET_STRAIGHT_RPM = 900.0
-TARGET_MIN_TURN_RPM = 350.0
+TARGET_STRAIGHT_RPM = 2500.0 # 2000 # 1100.0 # 1000.0
+TARGET_MIN_TURN_RPM = 400.0  # 350.0
 TARGET_SEARCH_RPM = 300.0
-TARGET_TURN_COMMIT_RPM = 300.0
-TARGET_CONFIDENCE_SLOWDOWN_BELOW = 0.35
-TARGET_CONFIDENCE_SLOWDOWN_AMOUNT = 0.45
+TARGET_TURN_COMMIT_RPM = 900 # 800.0 # 300
+TARGET_CONFIDENCE_SLOWDOWN_BELOW = 0.25
+TARGET_CONFIDENCE_SLOWDOWN_AMOUNT = 0.35
 
-SPEED_PID_KP = 0.020
-SPEED_PID_KI = 0.006
+SPEED_PID_KP = 0.05 # 0.04 # 0.020
+SPEED_PID_KI = 0.002 # 0.003 # 0.006
 SPEED_PID_KD = 0.0
 SPEED_PID_INTEGRAL_LIMIT_RPM_S = 1500.0
 SPEED_PID_DERIVATIVE_ALPHA = 0.35
@@ -102,43 +104,43 @@ SPEED_STALL_RPM_THRESHOLD = 60.0
 SPEED_STALL_TARGET_RPM_THRESHOLD = 250.0
 SPEED_STALL_TIMEOUT_MS = 1000
 SPEED_OVERSPEED_RPM_MARGIN = 180.0
-SPEED_OVERSPEED_DUTY_DROP = 3
+SPEED_OVERSPEED_DUTY_DROP = 0 #1 #2 # 3
 
 PREEMPTIVE_BRAKE_ENABLE = True
-LOOKAHEAD_BRAKE_START_DEG = 8.0
-LOOKAHEAD_BRAKE_FULL_DEG = 24.0
+LOOKAHEAD_BRAKE_START_DEG = 4.0 # 5.0 # 8.0
+LOOKAHEAD_BRAKE_FULL_DEG = 15.0 # 14 # 16.0 # 24.0
 LOOKAHEAD_MIN_DUTY_PERCENT = 7
 
 # Far-vs-near lookahead response.
 # Difference is measured in pixels:
 #   far lane center - near fitted-line prediction at the far-field y.
-LOOKAHEAD_STEER_DIFF_SENSITIVITY = 0.09  # 0.05   # demand per px of far/near difference
-LOOKAHEAD_STEER_MAX_US = 120  # 180              # max steering added from far-field change
-LOOKAHEAD_SPEED_DIFF_SENSITIVITY = 0.2  # 0.04   # demand per px of far/near difference
-LOOKAHEAD_SPEED_MAX_DUTY_DROP = 4         # max duty removed from far-field change
+LOOKAHEAD_STEER_DIFF_SENSITIVITY =  0.16 # 0.11  # 0.09  # 0.05   # demand per px of far/near difference
+LOOKAHEAD_STEER_MAX_US = 80 # 90 # 180           # max steering added from far-field change
+LOOKAHEAD_SPEED_DIFF_SENSITIVITY = 0.06  # 0.04   # demand per px of far/near difference
+LOOKAHEAD_SPEED_MAX_DUTY_DROP = 4 # 7 # 15          # max duty removed from far-field change
 
 MID_HEADING_FALLBACK_ENABLE = True
 MID_HEADING_FALLBACK_MIN_DEG = 3.0
 MID_HEADING_FALLBACK_SCALE = .9  # more = more turning
 
 # -------------------------- TURN COMMIT TUNING --------------------------
-TURN_COMMIT_MID_IDXS = (1, 2)      # near-mid and mid slices dominate during commit
-TURN_COMMIT_MID_GAIN = 2.4
+TURN_COMMIT_MID_IDXS = (1, 3)      # near-mid and mid slices dominate during commit
+TURN_COMMIT_MID_GAIN = 3.0 #2.4
 TURN_COMMIT_NEAR_GAIN = 0.60
 
 TURN_COMMIT_SEARCH_BIAS_PX = 26
 TURN_COMMIT_MIN_STEER_US = 220
-TURN_COMMIT_MIN_HEADING_DEG = 4.0
-TURN_COMMIT_DUTY_PERCENT = 8
+TURN_COMMIT_MIN_HEADING_DEG = 3 # 4.0
+TURN_COMMIT_DUTY_PERCENT = 15 # 8
 
 # -------------------------- NEAR ANCHOR TUNING --------------------------
-NEAR_ANCHOR_IDX = 0
-NEAR_ANCHOR_BLEND = 0.85
+NEAR_ANCHOR_IDX = 1 # 0
+NEAR_ANCHOR_BLEND = 0.65 # 0.85
 NEAR_ANCHOR_MIN_QUALITY = 0.30
-TURN_COMMIT_REQUIRES_NEAR_LOSS = True
+TURN_COMMIT_REQUIRES_NEAR_LOSS = False # True
 
 # -------------------------- VISION TUNING --------------------------
-WHITE_THRESHOLD = [(155, 255)]
+WHITE_THRESHOLD = [(215, 255)] # [(155, 255)]
 # QQVGA= 160W X 120L
 
 MAX_BLOB_WIDTH = 150  # 80
@@ -149,10 +151,10 @@ MAX_BLOB_PIXELS = 3000
 # higher = rejects weak/noisy blobs, but may accidentally reject real tape
 MIN_BLOB_DENSITY = 0.10  # 0.18
 
-EXPECTED_LANE_WIDTH = 130
+EXPECTED_LANE_WIDTH = 105 # 120 # 130
 MIN_LANE_WIDTH = 25
 MAX_LANE_WIDTH = 160
-ONE_LINE_OFFSET = 68
+ONE_LINE_OFFSET = 52 # 62 # 68
 
 WIDTH_SCORE_GAIN = 1.0
 CENTER_SCORE_GAIN = 0.8  # 2.2
@@ -174,7 +176,7 @@ MAX_MISSING_FRAMES = 8
 # ALPHA_CENTER          # smoothing of fitted-line lateral error
 # ALPHA_HEADING         # smoothing of heading debug / recovery estimate
 
-ALPHA_CENTER = 0.5
+ALPHA_CENTER = 0.6 # 0.5  # filters lateral error. Higher = +responsive, lower = smoother. If wobbles, lower it a bit.
 ALPHA_HEADING = 0.85
 ALPHA_WIDTH = 0.35
 
@@ -213,13 +215,13 @@ START_DELAY_MS = 1500
 
 LANE_SLICES = [  # x, y, w, h, weight, allow_one_line,
                  # px_thresh, area_thresh, expected_width, min_width, max_width
-    (0, 88, 160, 26, 0.22, True,  6, 6, 145, 70, 160),  # near
-    (0, 76, 160, 16, 0.35, True,  6, 6, 130, 60, 155),  # near-mid
-    (0, 64, 160, 12, 0.18, True,  6, 6, 110, 50, 145),  # mid
-    (0, 54, 160,  9, 0.11, False, 5, 5,  90, 40, 130),  # far
-    (0, 45, 160,  8, 0.08, False, 4, 5,  75, 30, 115),
-    (0, 37, 160,  7, 0.05, False, 4, 4,  60, 25, 100),
-    (0, 30, 160,  6, 0.03, False, 3, 4,  50, 20,  90),
+    (0, 88, 160, 26, 0.10, True,  6, 6, 135, 70, 160),  # near
+    (0, 76, 160, 16, 0.45, True,  6, 6, 120, 60, 155),  # near-mid
+    (0, 64, 160, 12, 0.18, True,  6, 6, 100, 50, 145),  # mid
+    (0, 54, 160,  9, 0.11, False, 5, 5,  80, 40, 130),  # far
+    (0, 45, 160,  8, 0.08, False, 4, 5,  65, 30, 115),
+    (0, 37, 160,  7, 0.05, False, 4, 4,  50, 25, 100),
+    (0, 30, 160,  6, 0.03, False, 3, 4,  40, 20,  90),
 ]
 
 # QQVGA= 160W X 120L
@@ -488,7 +490,8 @@ def update_speed_pid(target_rpm, measured_rpm, base_duty, now_ms, sensor_ok):
     trim = (SPEED_PID_KP * error) + \
            (SPEED_PID_KI * speed_pid_integral) + \
            (SPEED_PID_KD * speed_pid_filtered_derivative)
-    trim = clamp(trim, -SPEED_PID_MAX_DUTY_TRIM, SPEED_PID_MAX_DUTY_TRIM)
+    # trim = clamp(trim, -SPEED_PID_MAX_DUTY_TRIM, SPEED_PID_MAX_DUTY_TRIM)
+    trim = clamp(trim, 0, SPEED_PID_MAX_DUTY_TRIM)
 
     return int(clamp(base_duty + trim, 0, MOTOR_MAX_DUTY_PERCENT))
 
